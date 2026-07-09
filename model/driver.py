@@ -15,8 +15,8 @@ What this does:
 import torch
 import torch.nn as nn
 
-from config import SLMConfig
-from model import SLM
+from .config import SLMConfig
+from .model import SLM
 
 
 def main():

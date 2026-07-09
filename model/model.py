@@ -33,29 +33,20 @@ Assumed interfaces:
 import torch
 import torch.nn as nn
 
-from qvk_projections import QKVProjection
+from .qvk_projections import QKVProjection
 
 # ---- ADJUST THESE THREE IMPORTS TO MATCH YOUR ACTUAL FILES ----
-from norms import RMSNorm
-from attention import GQAAttention
-from swiglu import SwiGLUFeedForward
+from .norms import RMSNorm
+from .attention import GQAAttention
+from .swiglu import SwiGLUFeedForward
 # -----------------------------------------------------------------
 
-from config import SLMConfig
-
-
-def compute_ffn_dim(hidden_size: int, multiplier: float) -> int:
-    """
-    Standard SwiGLU sizing: raw multiplier is applied, then rounded to
-    nearest multiple of 8 for hardware-friendly matmul shapes (common
-    convention from LLaMA / Mistral configs).
-    """
-    raw = int(hidden_size * multiplier)
-    return ((raw + 7) // 8) * 8
-
+from .config import SLMConfig
+from ..Embedders.token_embedder import TokenEmbedding, LMHead
+from ..Embedders.rope import  RotaryEmbedding
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: SLMConfig):
+    def __init__(self, cfg: SLMConfig, rope: RotaryEmbedding):
         super().__init__()
         self.attn_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_eps)
         self.qkv = QKVProjection(
@@ -65,22 +56,26 @@ class TransformerBlock(nn.Module):
             bias=cfg.bias,
             init_std=cfg.init_std,
         )
+        # Shared across all layers (angles depend only on head_dim/position,
+        # not on layer index) — passed in rather than built per-block so we
+        # don't hold num_layers duplicate cos/sin tables.
+        self.rope = rope
+
         self.attn = GQAAttention(
             hidden_size=cfg.hidden_size,
             num_heads=cfg.num_heads,
             num_kv_groups=cfg.num_kv_groups,
             head_dim=cfg.head_dim,
             max_seq_len=cfg.max_seq_len,
-            init_std=cfg.init_std
-            
+            init_std=cfg.init_std,
         )
 
         self.ffn_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_eps)
-        ffn_dim = compute_ffn_dim(cfg.hidden_size, cfg.ffn_multiplier)
+        
         self.ffn = SwiGLUFeedForward(
-        hidden_size=cfg.hidden_size,
-        intermediate_size=ffn_dim,  # or just leave None to use its own 8/3 default
-        init_std=cfg.init_std,
+            hidden_size=cfg.hidden_size,
+            intermediate_size=None,
+            init_std=cfg.init_std,
         )
 
         self.dropout = nn.Dropout(cfg.dropout)
@@ -90,6 +85,7 @@ class TransformerBlock(nn.Module):
         residual = x
         h = self.attn_norm(x)
         Q, K, V = self.qkv(h)
+        Q, K = self.rope(Q, K)          # rotate Q/K before attention; V is untouched
         attn_out = self.attn(Q, K, V)
         x = residual + self.dropout(attn_out)
 
@@ -107,29 +103,39 @@ class SLM(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.embed = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        # Tied input embedding / output head, per token_embedder.py.
+        # LMHead reads token_embedding.weight live at every forward call,
+        # so there is only ever one (vocab_size, hidden_size) tensor —
+        # cfg.tie_embeddings is assumed True, matching this module's design.
+        self.token_embedding = TokenEmbedding(
+            vocab_size=cfg.vocab_size,
+            hidden_size=cfg.hidden_size,
+            init_std=cfg.init_std,
+        )
+        self.lm_head = LMHead(self.token_embedding, bias=False)
+
+        # One shared RoPE table for every layer.
+        self.rope = RotaryEmbedding(head_dim=cfg.head_dim, max_seq_len=cfg.max_seq_len)
+
         self.layers = nn.ModuleList(
-            [TransformerBlock(cfg) for _ in range(cfg.num_layers)]
+            [TransformerBlock(cfg, self.rope) for _ in range(cfg.num_layers)]
         )
         self.final_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_eps)
 
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        if cfg.tie_embeddings:
-            self.lm_head.weight = self.embed.weight  # weight tying
-
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.normal_(self.embed.weight, mean=0.0, std=self.cfg.init_std)
-        if not self.cfg.tie_embeddings:
-            nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.cfg.init_std)
+        if not cfg.tie_embeddings:
+            raise NotImplementedError(
+                "cfg.tie_embeddings=False is not supported by this TokenEmbedding/"
+                "LMHead pair — LMHead has no independent weight to untie. "
+                "Set cfg.tie_embeddings=True, or extend LMHead to optionally "
+                "own its own weight."
+            )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
         token_ids: (batch, seq_len) long tensor
         returns logits: (batch, seq_len, vocab_size)
         """
-        x = self.embed(token_ids)
+        x = self.token_embedding(token_ids)
         for layer in self.layers:
             x = layer(x)
         x = self.final_norm(x)
@@ -140,6 +146,6 @@ class SLM(nn.Module):
         if exclude_embeddings:
             return sum(
                 p.numel() for n, p in self.named_parameters()
-                if "embed" not in n and "lm_head" not in n
+                if "token_embedding" not in n and "lm_head" not in n
             )
         return sum(p.numel() for p in self.parameters())
