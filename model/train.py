@@ -49,6 +49,7 @@ import torch
 
 from .config import SLMConfig
 from .model import SLM
+from .checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 
 
 # --------------------------------------------------------------------------
@@ -105,6 +106,11 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # 1 -> 0
     return min_lr + coeff * (max_lr - min_lr)
 
+def make_lr_lambda(warmup_steps, max_steps, max_lr, min_lr):
+    def lr_lambda(step):
+        return get_lr(step, warmup_steps, max_steps, max_lr, min_lr) / max_lr
+    return lr_lambda
+
 
 # --------------------------------------------------------------------------
 # Evaluation
@@ -151,7 +157,9 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--eval_every", type=int, default=250)
     p.add_argument("--eval_iters", type=int, default=50)
+
     p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--keep_last_n", type=int, default=3,help="Number of rolling step-checkpoints to retain (best is always kept too)")
 
     p.add_argument("--resume", action="store_true",
                    help="Resume from out_dir/latest.pt if it exists")
@@ -189,17 +197,25 @@ def main():
         betas=(0.9, 0.95),
     )
 
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=make_lr_lambda(args.warmup_steps, args.max_steps, args.max_lr, args.min_lr),
+    )
+
     start_step = 0
     best_val_loss = float("inf")
+    last_val_loss = None  # tracked so save_checkpoint always has a value, even off-eval steps
 
-    latest_path = os.path.join(args.out_dir, "latest.pt")
-    if args.resume and os.path.exists(latest_path):
-        ckpt = torch.load(latest_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_step = ckpt["step"] + 1
-        best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        print(f"Resumed from step {start_step} (best_val_loss={best_val_loss:.4f})")
+    if args.resume:
+        latest_path = find_latest_checkpoint(args.out_dir)
+        if latest_path is not None:
+            resumed_step, resumed_val_loss = load_checkpoint(
+                latest_path, model, optimizer, scheduler, scaler, cfg
+            )
+            start_step = resumed_step + 1
+            best_val_loss = resumed_val_loss if resumed_val_loss is not None else float("inf")
+            last_val_loss = resumed_val_loss
+            print(f"Resumed from step {start_step} (val_loss={resumed_val_loss})")
 
     # ---- Training loop ----
     model.train()
@@ -207,9 +223,7 @@ def main():
     running_loss = 0.0
 
     for step in range(start_step, args.max_steps):
-        lr = get_lr(step, args.warmup_steps, args.max_steps, args.max_lr, args.min_lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        lr = scheduler.get_last_lr()[0]
 
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
@@ -231,6 +245,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
         running_loss += step_loss
 
@@ -251,27 +266,23 @@ def main():
                                       device, args.eval_iters)
             print(f"  -> eval: val_loss {val_loss:.4f}")
 
+            last_val_loss = val_loss
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save({
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "best_val_loss": best_val_loss,
-                    "config": cfg,
-                }, os.path.join(args.out_dir, "best.pt"))
-                print(f"  -> saved new best checkpoint (val_loss={val_loss:.4f})")
 
-        # ---- Periodic "latest" checkpoint for resuming ----
+            save_checkpoint(
+                model, optimizer, scheduler, scaler,
+                step, val_loss, cfg, args.out_dir, args.keep_last_n,
+            )
+            print(f"  -> saved checkpoint at step {step} (val_loss={val_loss:.4f}, "f"best={best_val_loss:.4f})")
+
+        # ---- Periodic checkpoint for resuming (uses last known val_loss) ----
         if step % args.save_every == 0 and step > start_step:
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "best_val_loss": best_val_loss,
-                "config": cfg,
-            }, latest_path)
-
+            save_checkpoint(
+                model, optimizer, scheduler, scaler,
+                step, last_val_loss, cfg, args.out_dir, args.keep_last_n,
+            )
+        
     print("Training complete.")
 
 
