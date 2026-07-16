@@ -151,7 +151,7 @@ def parse_args():
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--eval_every", type=int, default=250)
     p.add_argument("--eval_iters", type=int, default=50)
-    p.add_argument("--save_every", type=int, default=500)
+    p.add_argument("--save_every", type=int, default=100)
 
     p.add_argument("--resume", action="store_true",
                    help="Resume from out_dir/latest.pt if it exists")
@@ -194,7 +194,7 @@ def main():
 
     latest_path = os.path.join(args.out_dir, "latest.pt")
     if args.resume and os.path.exists(latest_path):
-        ckpt = torch.load(latest_path, map_location=device)
+        ckpt = torch.load(latest_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"] + 1
