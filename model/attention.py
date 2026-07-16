@@ -66,15 +66,12 @@ class GQAAttention(nn.Module):
         k = self._expand_kv(k)  # (batch, num_heads, seq_len, head_dim)
         v = self._expand_kv(v)  # (batch, num_heads, seq_len, head_dim)
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        # (batch, num_heads, seq_len, seq_len)
-
-        mask = self.causal_mask[:seq_len, :seq_len]
-        attn_scores = attn_scores.masked_fill(mask, float("-inf"))
-
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        attn_output = torch.matmul(attn_weights, v)  # (batch, num_heads, seq_len, head_dim)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            dropout_p=0.0, 
+            is_causal=True
+        )
 
         attn_output = (
             attn_output.transpose(1, 2)

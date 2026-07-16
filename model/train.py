@@ -51,6 +51,9 @@ from .config import SLMConfig
 from .model import SLM
 from .checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+torch.cuda.empty_cache()
+
 
 # --------------------------------------------------------------------------
 # Data loading (see assumption above)
@@ -143,8 +146,8 @@ def parse_args():
                    help="Where to save checkpoints")
 
     # Optimization
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--grad_accum_steps", type=int, default=1,
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--grad_accum_steps", type=int, default=16,
                    help="Accumulate gradients over N micro-batches for a larger effective batch size")
     p.add_argument("--max_steps", type=int, default=20000)
     p.add_argument("--warmup_steps", type=int, default=500)
