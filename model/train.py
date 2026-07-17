@@ -163,7 +163,6 @@ def parse_args():
 
     p.add_argument("--save_every", type=int, default=500)
     p.add_argument("--keep_last_n", type=int, default=3,help="Number of rolling step-checkpoints to retain (best is always kept too)")
-
     p.add_argument("--resume", action="store_true",
                    help="Resume from out_dir/latest.pt if it exists")
     p.add_argument("--seed", type=int, default=0)
